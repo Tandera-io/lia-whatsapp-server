@@ -1,0 +1,4 @@
+# Force Sharp to use the correct platform binaries
+target_platform=linuxmusl
+target_arch=x64
+target_libc=musl
