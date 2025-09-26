@@ -241,29 +241,66 @@ export async function closeSession(req: Request, res: Response): Promise<any> {
    */
   const session = req.session;
   try {
-    if ((clientsArray as any)[session].status === null) {
+    // Check if session exists in clientsArray
+    if (!clientsArray[session]) {
       return await res
-        .status(200)
-        .json({ status: true, message: 'Session successfully closed' });
-    } else {
-      (clientsArray as any)[session] = { status: null };
-
-      await req.client.close();
-      req.io.emit('whatsapp-status', false);
-      callWebHook(req.client, req, 'closesession', {
-        message: `Session: ${session} disconnected`,
-        connected: false,
-      });
-
-      return await res
-        .status(200)
-        .json({ status: true, message: 'Session successfully closed' });
+        .status(404)
+        .json({ status: false, message: 'Session not found' });
     }
+
+    // Check if session is already closed
+    if (clientsArray[session].status === null) {
+      return await res
+        .status(200)
+        .json({ status: true, message: 'Session already closed' });
+    }
+
+    // Update session status to null before closing
+    clientsArray[session] = { status: null };
+
+    // Close the WhatsApp client connection
+    if (req.client) {
+      try {
+        await req.client.close();
+        req.logger.info(`Session ${session} client closed successfully`);
+      } catch (clientError) {
+        req.logger.warn(
+          `Error closing client for session ${session}:`,
+          clientError
+        );
+        // Continue with cleanup even if client close fails
+      }
+    }
+
+    // Emit status change to connected clients
+    req.io.emit('whatsapp-status', false);
+    req.io.emit('session-status', {
+      session,
+      status: 'CLOSED',
+      timestamp: new Date().toISOString(),
+    });
+
+    // Call webhook to notify about session closure
+    callWebHook(req.client, req, 'closesession', {
+      message: `Session: ${session} closed`,
+      connected: false,
+      timestamp: new Date().toISOString(),
+    });
+
+    return await res.status(200).json({
+      status: true,
+      message: 'Session closed successfully',
+      session,
+      timestamp: new Date().toISOString(),
+    });
   } catch (error) {
-    req.logger.error(error);
-    return await res
-      .status(500)
-      .json({ status: false, message: 'Error closing session', error });
+    req.logger.error(`Error closing session ${session}:`, error);
+    return await res.status(500).json({
+      status: false,
+      message: 'Error closing session',
+      error: error instanceof Error ? error.message : 'Unknown error',
+      session,
+    });
   }
 }
 
@@ -280,50 +317,120 @@ export async function logOutSession(req: Request, res: Response): Promise<any> {
       schema: 'NERDWHATS_AMERICA'
      }
    */
+  const session = req.session;
   try {
-    const session = req.session;
-    await req.client.logout();
-    deleteSessionOnArray(req.session);
-
-    setTimeout(async () => {
-      const pathUserData = config.customUserDataDir + req.session;
-      const pathTokens = __dirname + `../../../tokens/${req.session}.data.json`;
-
-      if (fs.existsSync(pathUserData)) {
-        await fs.promises.rm(pathUserData, {
-          recursive: true,
-          maxRetries: 5,
-          force: true,
-          retryDelay: 1000,
-        });
-      }
-      if (fs.existsSync(pathTokens)) {
-        await fs.promises.rm(pathTokens, {
-          recursive: true,
-          maxRetries: 5,
-          force: true,
-          retryDelay: 1000,
-        });
-      }
-
-      req.io.emit('whatsapp-status', false);
-      callWebHook(req.client, req, 'logoutsession', {
-        message: `Session: ${session} logged out`,
-        connected: false,
+    // Check if session exists
+    if (!session) {
+      return res.status(400).json({
+        status: false,
+        message: 'Session name is required',
       });
+    }
 
-      return await res
-        .status(200)
-        .json({ status: true, message: 'Session successfully closed' });
+    req.logger.info(`Starting logout process for session: ${session}`);
+
+    // Logout from WhatsApp
+    if (req.client) {
+      try {
+        await req.client.logout();
+        req.logger.info(
+          `Successfully logged out from WhatsApp for session: ${session}`
+        );
+      } catch (logoutError) {
+        req.logger.warn(
+          `Error during WhatsApp logout for session ${session}:`,
+          logoutError
+        );
+        // Continue with cleanup even if logout fails
+      }
+    }
+
+    // Remove session from memory
+    deleteSessionOnArray(session);
+
+    // Emit status updates immediately
+    req.io.emit('whatsapp-status', false);
+    req.io.emit('session-status', {
+      session,
+      status: 'LOGGED_OUT',
+      timestamp: new Date().toISOString(),
+    });
+
+    // Send immediate response
+    res.status(200).json({
+      status: true,
+      message: 'Logout initiated successfully',
+      session,
+      timestamp: new Date().toISOString(),
+    });
+
+    // Perform cleanup in background
+    setTimeout(async () => {
+      try {
+        const pathUserData = config.customUserDataDir + session;
+        const pathTokens = __dirname + `../../../tokens/${session}.data.json`;
+
+        req.logger.info(`Cleaning up session data for: ${session}`);
+
+        // Remove user data directory
+        if (fs.existsSync(pathUserData)) {
+          try {
+            await fs.promises.rm(pathUserData, {
+              recursive: true,
+              maxRetries: 5,
+              force: true,
+              retryDelay: 1000,
+            });
+            req.logger.info(`Removed user data directory: ${pathUserData}`);
+          } catch (cleanupError) {
+            req.logger.error(
+              `Error removing user data directory: ${pathUserData}`,
+              cleanupError
+            );
+          }
+        }
+
+        // Remove token file
+        if (fs.existsSync(pathTokens)) {
+          try {
+            await fs.promises.rm(pathTokens, {
+              recursive: true,
+              maxRetries: 5,
+              force: true,
+              retryDelay: 1000,
+            });
+            req.logger.info(`Removed token file: ${pathTokens}`);
+          } catch (cleanupError) {
+            req.logger.error(
+              `Error removing token file: ${pathTokens}`,
+              cleanupError
+            );
+          }
+        }
+
+        // Send final webhook notification
+        callWebHook(req.client, req, 'logoutsession', {
+          message: `Session: ${session} logged out and cleaned up`,
+          connected: false,
+          timestamp: new Date().toISOString(),
+        });
+
+        req.logger.info(`Session cleanup completed for: ${session}`);
+      } catch (cleanupError) {
+        req.logger.error(
+          `Error during session cleanup for ${session}:`,
+          cleanupError
+        );
+      }
     }, 500);
-    /*try {
-      await req.client.close();
-    } catch (error) {}*/
   } catch (error) {
-    req.logger.error(error);
-    res
-      .status(500)
-      .json({ status: false, message: 'Error closing session', error });
+    req.logger.error(`Error during logout for session ${session}:`, error);
+    res.status(500).json({
+      status: false,
+      message: 'Error during logout',
+      error: error instanceof Error ? error.message : 'Unknown error',
+      session,
+    });
   }
 }
 
@@ -461,6 +568,63 @@ export async function getMediaByMessage(req: Request, res: Response) {
     res.status(500).json({
       status: 'error',
       message: 'The session is not active',
+      error: ex,
+    });
+  }
+}
+
+export async function serveMediaFile(req: Request, res: Response) {
+  /**
+   * #swagger.tags = ["Messages"]
+     #swagger.autoBody=false
+     #swagger.operationId = 'serveMediaFile'
+     #swagger.security = [{
+            "bearerAuth": []
+     }]
+     #swagger.parameters["session"] = {
+      schema: 'NERDWHATS_AMERICA'
+     }
+     #swagger.parameters["messageId"] = {
+      schema: 'messageId'
+     }
+   */
+  const client = req.client;
+  const { messageId } = req.params;
+
+  try {
+    const message = await client.getMessageById(messageId);
+
+    if (!message) {
+      return res.status(404).json({
+        status: 'error',
+        message: 'Message not found',
+      });
+    }
+
+    if (!(message['mimetype'] || message.isMedia || message.isMMS)) {
+      return res.status(400).json({
+        status: 'error',
+        message: 'Message does not contain media',
+      });
+    }
+
+    const buffer = await client.decryptFile(message);
+
+    // Set appropriate headers
+    res.setHeader(
+      'Content-Type',
+      message.mimetype || 'application/octet-stream'
+    );
+    res.setHeader('Content-Length', buffer.length);
+    res.setHeader('Cache-Control', 'public, max-age=31536000'); // Cache for 1 year
+
+    // Send the buffer as response
+    res.send(buffer);
+  } catch (ex) {
+    req.logger.error(ex);
+    res.status(500).json({
+      status: 'error',
+      message: 'Error serving media file',
       error: ex,
     });
   }

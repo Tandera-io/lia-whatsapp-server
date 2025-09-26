@@ -61,6 +61,19 @@ routes.get(
   SessionController.getMediaByMessage
 );
 routes.get(
+  '/api/:session/media/:messageId',
+  (req, res, next) => {
+    // Check for authorization in query parameters for direct media access
+    const authQuery = req.query.authorization as string;
+    if (authQuery && !req.headers.authorization) {
+      req.headers.authorization = authQuery;
+    }
+    next();
+  },
+  verifyToken,
+  SessionController.serveMediaFile
+);
+routes.get(
   '/api/:session/get-platform-from-message/:messageId',
   verifyToken,
   DeviceController.getPlatformFromMessage
@@ -763,6 +776,12 @@ routes.get(
   verifyToken,
   statusConnection,
   DeviceController.getProfilePicFromServer
+);
+routes.get(
+  '/api/:session/profile-pic',
+  verifyToken,
+  statusConnection,
+  DeviceController.getMyProfilePic
 );
 routes.get(
   '/api/:session/profile-status/:phone',

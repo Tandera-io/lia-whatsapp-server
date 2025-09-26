@@ -212,13 +212,46 @@ export async function listChats(req: Request, res: Response) {
   try {
     const {
       id,
-      count,
+      count = 100, // Default to 100 chats if not specified
       direction,
       onlyGroups,
       onlyUsers,
       onlyWithUnreadMessage,
       withLabels,
     } = req.body;
+
+    // Check if client is properly connected before attempting to list chats
+    if (!req.client) {
+      req.logger.warn('Client not available for listChats request');
+      return res.status(503).json({
+        status: 'error',
+        message:
+          'WhatsApp client not available. Please ensure the session is properly connected.',
+        code: 'CLIENT_NOT_AVAILABLE',
+      });
+    }
+
+    // Verify connection status before proceeding
+    let isConnected = false;
+    try {
+      isConnected = await req.client.isConnected();
+    } catch (connError) {
+      req.logger.warn('Connection check failed:', connError);
+    }
+
+    if (!isConnected) {
+      req.logger.warn('Client not connected for listChats request');
+      return res.status(503).json({
+        status: 'error',
+        message:
+          'WhatsApp client is not connected. Please wait for the session to be fully established.',
+        code: 'CLIENT_NOT_CONNECTED',
+      });
+    }
+
+    req.logger.info(
+      `Listing chats with count: ${count}, onlyGroups: ${onlyGroups}, onlyUsers: ${onlyUsers}`
+    );
 
     const response = await req.client.listChats({
       id: id,
@@ -230,12 +263,35 @@ export async function listChats(req: Request, res: Response) {
       withLabels: withLabels,
     });
 
-    res.status(200).json(response);
-  } catch (e) {
-    req.logger.error(e);
-    res
-      .status(500)
-      .json({ status: 'error', message: 'Error on get all chats' });
+    // Ensure response is an array
+    const chatsArray = Array.isArray(response) ? response : [];
+
+    req.logger.info(`Successfully retrieved ${chatsArray.length} chats`);
+    res.status(200).json(chatsArray);
+  } catch (e: any) {
+    req.logger.error('Error in listChats:', e);
+
+    // Provide more specific error handling
+    let errorMessage = 'Error on get all chats';
+    let statusCode = 500;
+
+    if (e.message && e.message.includes('not found')) {
+      errorMessage = 'Session not found or not ready';
+      statusCode = 404;
+    } else if (e.message && e.message.includes('timeout')) {
+      errorMessage = 'Request timeout while fetching chats';
+      statusCode = 504;
+    } else if (e.message && e.message.includes('connection')) {
+      errorMessage = 'Connection error while fetching chats';
+      statusCode = 503;
+    }
+
+    res.status(statusCode).json({
+      status: 'error',
+      message: errorMessage,
+      details: e.message || 'Unknown error',
+      code: 'LIST_CHATS_ERROR',
+    });
   }
 }
 
@@ -1440,17 +1496,70 @@ export async function getMessages(req: Request, res: Response) {
   const { phone } = req.params;
   const { count = 20, direction = 'before', id = null } = req.query;
   try {
+    // First, try to check if chat exists
+    let chatExists = true;
+    try {
+      await req.client.getChatById(`${phone}`);
+    } catch (chatError) {
+      chatExists = false;
+      req.logger.warn(`Chat ${phone} not found or not accessible:`, chatError);
+    }
+
+    if (!chatExists) {
+      return res.status(404).json({
+        status: 'error',
+        response: 'Chat not found or not accessible',
+        error: {
+          code: 'chat_not_found',
+          id: phone,
+          level: 'warn',
+          message:
+            'The requested chat does not exist or you do not have access to it',
+        },
+      });
+    }
+
     const response = await req.client.getMessages(`${phone}`, {
       count: parseInt(count as string),
       direction: direction.toString() as any,
       id: id as string,
     });
     res.status(200).json({ status: 'success', response: response });
-  } catch (e) {
-    req.logger.error(e);
-    res
-      .status(401)
-      .json({ status: 'error', response: 'Error on open list', error: e });
+  } catch (e: any) {
+    req.logger.error('Error getting messages for chat:', phone, e);
+
+    // Check if it's a specific chat not found error
+    const errorMessage = e?.message || e?.toString() || 'Unknown error';
+    const isNotFound =
+      errorMessage.toLowerCase().includes('not found') ||
+      errorMessage.toLowerCase().includes('chat not found') ||
+      errorMessage.toLowerCase().includes('does not exist');
+
+    if (isNotFound) {
+      res.status(404).json({
+        status: 'error',
+        response: 'Error on open list',
+        error: {
+          code: 'chat_not_found',
+          id: phone,
+          level: 'error',
+          message: 'Chat not found or not accessible',
+          details: errorMessage,
+        },
+      });
+    } else {
+      res.status(500).json({
+        status: 'error',
+        response: 'Error on open list',
+        error: {
+          code: 'internal_error',
+          id: phone,
+          level: 'error',
+          message: 'Internal server error while fetching messages',
+          details: errorMessage,
+        },
+      });
+    }
   }
 }
 
@@ -1606,11 +1715,40 @@ export async function sendSeen(req: Request, res: Response) {
   try {
     const results: any = [];
     for (const contato of phone) {
-      results.push(await req.client.sendSeen(contato));
+      // Skip @lid contacts for sendSeen as they cause InvalidWidError
+      if (contato.includes('@lid')) {
+        req.logger.warn(`Skipping sendSeen for @lid contact: ${contato}`);
+        results.push({
+          contact: contato,
+          status: 'skipped',
+          reason: 'lid_not_supported',
+        });
+        continue;
+      }
+
+      try {
+        const result = await req.client.sendSeen(contato);
+        results.push(result);
+      } catch (contactError: any) {
+        req.logger.warn(`Failed to send seen for ${contato}:`, contactError);
+        results.push({
+          contact: contato,
+          status: 'error',
+          error: contactError.message || 'Unknown error',
+        });
+      }
     }
     returnSucess(res, session, phone, results);
   } catch (error) {
-    returnError(req, res, session, error);
+    // Only call returnError if response hasn't been sent yet
+    if (!res.headersSent) {
+      returnError(req, res, session, error);
+    } else {
+      req.logger.error(
+        'Headers already sent, cannot send error response:',
+        error
+      );
+    }
   }
 }
 
@@ -1850,6 +1988,20 @@ export async function checkNumberStatus(req: Request, res: Response) {
   try {
     let response;
     for (const contato of contactToArray(phone, false)) {
+      // Skip @lid IDs as they often cause InvalidWidError
+      if (contato.includes('@lid')) {
+        req.logger.warn(
+          `Skipping @lid contact: ${contato} - not supported for status check`
+        );
+        response = {
+          numberExists: false,
+          canReceiveMessage: false,
+          id: { _serialized: contato },
+          error: 'lid_not_supported',
+        };
+        continue;
+      }
+
       response = await req.client.checkNumberStatus(`${contato}`);
     }
 
@@ -1974,12 +2126,52 @@ export async function getProfilePicFromServer(req: Request, res: Response) {
       response = await req.client.getProfilePicFromServer(contato);
     }
 
-    res.status(200).json({ status: 'success', response: response });
+    res
+      .status(200)
+      .json({ status: 'success', response: { profilePic: response } });
   } catch (error) {
     req.logger.error(error);
     res.status(500).json({
       status: 'error',
       message: 'Error on  get profile pic',
+      error: error,
+    });
+  }
+}
+
+export async function getMyProfilePic(req: Request, res: Response) {
+  /**
+     #swagger.tags = ["Profile"]
+     #swagger.autoBody=false
+     #swagger.security = [{
+            "bearerAuth": []
+     }]
+     #swagger.parameters["session"] = {
+      schema: 'NERDWHATS_AMERICA'
+     }
+   */
+  try {
+    // Get current user's WhatsApp ID (WID)
+    const currentUserWid = await req.client.getWid();
+
+    if (!currentUserWid) {
+      return res.status(400).json({
+        status: 'error',
+        message: 'Could not get current user WID',
+      });
+    }
+
+    // Use the current user's WID to get their profile picture
+    const response = await req.client.getProfilePicFromServer(currentUserWid);
+
+    res
+      .status(200)
+      .json({ status: 'success', response: { profilePic: response } });
+  } catch (error) {
+    req.logger.error(error);
+    res.status(500).json({
+      status: 'error',
+      message: 'Error on get my profile pic',
       error: error,
     });
   }

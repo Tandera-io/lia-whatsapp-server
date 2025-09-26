@@ -40,12 +40,26 @@ export default async function statusConnection(
           localArr[index] = contact;
         } else if (numbers.indexOf(contact) < 0) {
           console.log(contact);
+
+          // Skip @lid contacts as they often cause InvalidWidError
+          if (contact.includes('@lid')) {
+            console.log(`Skipping @lid contact validation: ${contact}`);
+            // Keep the contact as is, but don't validate it
+            localArr[index] = contact;
+            index++;
+            continue;
+          }
+
           const profile: any = await req.client
             .checkNumberStatus(contact)
-            .catch((error) => console.log(error));
+            .catch((error) => {
+              console.log(`Error checking status for ${contact}:`, error);
+              return null;
+            });
+
           if (!profile?.numberExists) {
             const num = (contact as any).split('@')[0];
-            res.status(400).json({
+            return res.status(400).json({
               response: null,
               status: 'Connected',
               message: `O número ${num} não existe.`,
