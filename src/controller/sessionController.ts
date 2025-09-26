@@ -454,6 +454,7 @@ export async function checkConnectionSession(
 
     res.status(200).json({ status: true, message: 'Connected' });
   } catch (error) {
+    // Connection check failed, client is disconnected
     res.status(200).json({ status: false, message: 'Disconnected' });
   }
 }

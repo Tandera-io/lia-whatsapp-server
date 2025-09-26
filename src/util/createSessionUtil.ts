@@ -115,7 +115,9 @@ export default class CreateSessionUtil {
                   session: client.session,
                 });
                 req.logger.info(statusFind + '\n\n');
-              } catch (error) {}
+              } catch (error) {
+                // Silently ignore errors in status handling
+              }
             },
           }
         )

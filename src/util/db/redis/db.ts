@@ -1,5 +1,6 @@
 import config from '../../../config';
 
+// eslint-disable-next-line @typescript-eslint/no-require-imports
 const redis = config.tokenStoreType === 'redis' ? require('redis') : null;
 
 let RedisClient: any = null;

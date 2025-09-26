@@ -1,6 +1,7 @@
 //import mongoose from 'mongoose';
 import config from '../../../config';
 
+// eslint-disable-next-line @typescript-eslint/no-require-imports
 const mongoose =
   config.tokenStoreType === 'mongodb' ? require('mongoose') : null;
 
